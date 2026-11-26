@@ -38,6 +38,38 @@ import { getAuth, signInAnonymously, signInWithCustomToken } from 'firebase/auth
 import { getFirestore, doc, setDoc, onSnapshot, getDoc, updateDoc } from 'firebase/firestore';
 
 // ============================================================================
+// 0. Node.js 24 / モダンブラウザ両対応ユーティリティ（Web Crypto・非破壊ソート）
+// ============================================================================
+function getSecureRandomInt(maxExclusive) {
+  if (maxExclusive <= 1) return 0;
+  const webCrypto = globalThis.crypto;
+  if (webCrypto && typeof webCrypto.getRandomValues === 'function') {
+    const array = new Uint32Array(1);
+    const limit = Math.floor(0xffffffff / maxExclusive) * maxExclusive;
+    let randVal = 0;
+    do {
+      webCrypto.getRandomValues(array);
+      randVal = array[0];
+    } while (randVal >= limit);
+    return randVal % maxExclusive;
+  }
+  return Math.floor(Math.random() * maxExclusive);
+}
+
+function secureShuffle(items) {
+  const arr = [...items];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = getSecureRandomInt(i + 1);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function generateSecureRoomCode() {
+  return String(1000 + getSecureRandomInt(9000));
+}
+
+// ============================================================================
 // 1. Firebase 初期化（グローバル環境変数がある場合のみ接続・未設定時は安全にフォールバック）
 // ============================================================================
 let dbInstance = null;
@@ -56,12 +88,12 @@ try {
       signInAnonymously(authInstance).catch(() => {});
     }
   }
-} catch (e) {
+} catch {
   // Firebase未設定時はBroadcastChannel同期で動作
 }
 
 // ============================================================================
-// 2. Web Audio API 効果音エンジン
+// 2. Web Audio API 効果音エンジン（globalThis 対応）
 // ============================================================================
 class SoundEffects {
   constructor() {
@@ -70,8 +102,8 @@ class SoundEffects {
   }
 
   init() {
-    if (!this.ctx && typeof window !== 'undefined') {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!this.ctx && typeof globalThis !== 'undefined') {
+      const AudioCtx = globalThis.AudioContext || globalThis.webkitAudioContext;
       if (AudioCtx) {
         this.ctx = new AudioCtx();
       }
@@ -139,7 +171,7 @@ class SoundEffects {
         osc.start(now);
         osc.stop(now + 0.25);
       }
-    } catch (e) {
+    } catch {
       // オーディオ再生エラー無視
     }
   }
@@ -279,11 +311,7 @@ function createShuffledDeck(extended = false) {
       });
     }
   });
-  for (let i = cards.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [cards[i], cards[j]] = [cards[j], cards[i]];
-  }
-  return cards;
+  return secureShuffle(cards);
 }
 
 function evaluateBestChemicalHand(handCards, communityCards, targetFormulaId = null) {
@@ -413,7 +441,7 @@ function calculateSidePotDistributions(players, evalResults) {
     return { payouts, pots: [] };
   }
 
-  const levels = Array.from(new Set(activeContributors.map((p) => p.totalContributed))).sort(
+  const levels = Array.from(new Set(activeContributors.map((p) => p.totalContributed))).toSorted(
     (a, b) => a - b
   );
   let prevLevel = 0;
@@ -726,7 +754,7 @@ export default function App() {
     if (targetSetting === 'specific') {
       return CHEMICAL_FORMULAS.find((f) => f.id === specificTargetId) || CHEMICAL_FORMULAS[0];
     }
-    const idx = Math.floor(Math.random() * CHEMICAL_FORMULAS.length);
+    const idx = getSecureRandomInt(CHEMICAL_FORMULAS.length);
     return CHEMICAL_FORMULAS[idx];
   }, [targetSetting, specificTargetId]);
 
@@ -901,11 +929,11 @@ export default function App() {
         null;
 
       if (quizFormula) {
-        const distractors = CHEMICAL_FORMULAS.filter((f) => f.id !== quizFormula.id)
-          .sort(() => Math.random() - 0.5)
-          .slice(0, 2);
-        const nameOptions = [quizFormula, ...distractors].sort(() => Math.random() - 0.5);
-        const propOptions = [quizFormula, ...distractors].sort(() => Math.random() - 0.5);
+        const distractors = secureShuffle(
+          CHEMICAL_FORMULAS.filter((f) => f.id !== quizFormula.id)
+        ).slice(0, 2);
+        const nameOptions = secureShuffle([quizFormula, ...distractors]);
+        const propOptions = secureShuffle([quizFormula, ...distractors]);
         setQuizState({
           targetFormula: quizFormula,
           nameOptions,
@@ -1089,54 +1117,57 @@ export default function App() {
             startNewGameFromOnline(data.seats);
           }
         });
-      } catch (e) {
+      } catch {
         // fallback to BroadcastChannel
       }
     }
 
     let ch = null;
     try {
-      ch = new BroadcastChannel(`gaku_poker_room_${roomCode}`);
-      bcRef.current = ch;
-      ch.onmessage = (ev) => {
-        const msg = ev.data;
-        if (!msg) return;
-        setSyncStatus('broadcast');
-        if (msg.type === 'JOIN_REQUEST' && isRoomHost) {
-          setOnlineSeats((prev) => {
-            const emptyIdx = prev.findIndex((s) => !s.filled);
-            if (emptyIdx === -1) return prev;
-            const next = [...prev];
-            next[emptyIdx] = {
-              seat: emptyIdx + 1,
-              name: msg.guestName || 'ゲスト研究員',
-              isCpu: false,
-              filled: true,
-              isHost: false,
-            };
-            broadcastRoomPayload(roomCode, { seats: next });
-            return next;
-          });
-        } else if (msg.type === 'ROOM_SYNC' && msg.payload) {
-          const p = msg.payload;
-          if (p.seats) setOnlineSeats(p.seats);
-          if (p.settings && !isRoomHost) {
-            setTotalSeats(p.settings.totalSeats ?? 4);
-            setGameRuleMode(p.settings.gameRuleMode ?? 'school');
-            setMaxHands(p.settings.maxHands ?? 5);
-            setUseExtendedDeck(Boolean(p.settings.useExtendedDeck));
-            setAllowLabExchange(Boolean(p.settings.allowLabExchange));
-            setAnteEnabled(Boolean(p.settings.anteEnabled));
-            setActionCountdownMode(Boolean(p.settings.actionCountdownMode));
-            setTargetSetting(p.settings.targetSetting ?? 'random');
-            setSpecificTargetId(p.settings.specificTargetId ?? 'CO2');
+      const ChannelCtor = globalThis.BroadcastChannel;
+      if (typeof ChannelCtor === 'function') {
+        ch = new ChannelCtor(`gaku_poker_room_${roomCode}`);
+        bcRef.current = ch;
+        ch.onmessage = (ev) => {
+          const msg = ev.data;
+          if (!msg) return;
+          setSyncStatus('broadcast');
+          if (msg.type === 'JOIN_REQUEST' && isRoomHost) {
+            setOnlineSeats((prev) => {
+              const emptyIdx = prev.findIndex((s) => !s.filled);
+              if (emptyIdx === -1) return prev;
+              const next = [...prev];
+              next[emptyIdx] = {
+                seat: emptyIdx + 1,
+                name: msg.guestName || 'ゲスト研究員',
+                isCpu: false,
+                filled: true,
+                isHost: false,
+              };
+              broadcastRoomPayload(roomCode, { seats: next });
+              return next;
+            });
+          } else if (msg.type === 'ROOM_SYNC' && msg.payload) {
+            const p = msg.payload;
+            if (p.seats) setOnlineSeats(p.seats);
+            if (p.settings && !isRoomHost) {
+              setTotalSeats(p.settings.totalSeats ?? 4);
+              setGameRuleMode(p.settings.gameRuleMode ?? 'school');
+              setMaxHands(p.settings.maxHands ?? 5);
+              setUseExtendedDeck(Boolean(p.settings.useExtendedDeck));
+              setAllowLabExchange(Boolean(p.settings.allowLabExchange));
+              setAnteEnabled(Boolean(p.settings.anteEnabled));
+              setActionCountdownMode(Boolean(p.settings.actionCountdownMode));
+              setTargetSetting(p.settings.targetSetting ?? 'random');
+              setSpecificTargetId(p.settings.specificTargetId ?? 'CO2');
+            }
+            if (p.started && !isRoomHost && p.seats) {
+              startNewGameFromOnline(p.seats);
+            }
           }
-          if (p.started && !isRoomHost && p.seats) {
-            startNewGameFromOnline(p.seats);
-          }
-        }
-      };
-    } catch (e) {
+        };
+      }
+    } catch {
       // ignore
     }
 
@@ -1221,7 +1252,7 @@ export default function App() {
   };
 
   const handleCreateOnlineRoom = () => {
-    const code = String(Math.floor(1000 + Math.random() * 9000));
+    const code = generateSecureRoomCode();
     const hostName = playerName.trim() || 'ホスト研究員';
     const seats = Array.from({ length: totalSeats }, (_, i) =>
       i === 0
@@ -1289,10 +1320,13 @@ export default function App() {
     }
 
     try {
-      const ch = new BroadcastChannel(`gaku_poker_room_${roomIdInput}`);
-      ch.postMessage({ type: 'JOIN_REQUEST', guestName });
-      ch.close();
-    } catch (e) {
+      const ChannelCtor = globalThis.BroadcastChannel;
+      if (typeof ChannelCtor === 'function') {
+        const ch = new ChannelCtor(`gaku_poker_room_${roomIdInput}`);
+        ch.postMessage({ type: 'JOIN_REQUEST', guestName });
+        ch.close();
+      }
+    } catch {
       // ignore
     }
 
@@ -3458,7 +3492,7 @@ export default function App() {
   // 画面4: 最終リザルト画面（総合ランキング・学習レポート・CSV出力）
   // ==========================================================================
   const renderGameOver = () => {
-    const sorted = [...players].sort((a, b) => b.points - a.points);
+    const sorted = players.toSorted((a, b) => b.points - a.points);
     return (
       <div className="max-w-5xl mx-auto px-4 py-6 space-y-5">
         <div className="bg-gradient-to-b from-amber-950/90 via-slate-900 to-slate-950 border-[4px] border-yellow-400 rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6">
